@@ -28,8 +28,7 @@
 |------|--------|------|
 | **起飞方案修复** | 🔴 阻塞 | MonitoredTakeoff → TurnOnMotors（见 §五） |
 | **四元数问题调查** | 🟡 中 | 回调输出全 0，计划改用 NED 直通绕过 |
-| **车-机状态机联动** | 🔴 核心 | 车辆检测到目标 → 触发无人机起飞 → 飞行动作 → 降落 → 反馈车辆 |
-| **闭环水平飞行** | 🟡 中 | 等起飞修复后，PID 位置控制 |
+| **车-机状态机联动** | 🔴 核心 | 已编写 `state_machine.py`（~390行），待起飞修复后联调 |
 | **AprilTag 精准降落** | 🟢 后 | 已有 tta_apriltag_detect.py，需集成到上位机 |
 
 ---
@@ -103,7 +102,6 @@ VO 的位移增量来源于视觉特征匹配，不依赖罗盘；只有 X-Y 该
 | v14 | ✅ | 106cm | ❌ | `Obtain joystick… failed` | MonitoredTakeoff z-lock |
 | v15 | ✅ | 106cm | ❌ | BODY mode 无效 | 四元数零 → 体坐标系速度被吃掉 |
 | v16 | ✅ | 106cm | ❌ | NED mode 无效 | MonitoredTakeoff 锁所有通道 |
-| v17 | ❌ | 0cm | — | 同上 arrest | 未调用 TurnOnMotors |
 
 ### 3.2 两个已锁定的致命问题
 
@@ -183,104 +181,40 @@ if(loopInput->flight_flag == 0) {
 └─────────────────┘              └──────────────┘           └──────┘
 ```
 
-### 5.2 状态定义
+### 5.2 车-机状态机联动（已实现 `state_machine.py`，~390 行）
+
+架构：**车辆（YL-R8, Jetson Nano）是主控端**，通过 WiFi TCP 发 JSON 指令。
+**本工程（M3E 无人机）是执行端**，接收指令后执行飞行。
+
+```
+车辆 (YL-R8, Nano)                   本工程 (M3E, 上位机)
+┌──────────────────┐   WiFi/TCP     ┌──────────────────────────┐
+│ rescue_sm.py      │  JSON指令      │ state_machine.py          │
+│                  │──────────────►│                          │
+│ cmd: "takeoff"   │               │ → 起飞 → PD悬停           │
+│ cmd: "fly_to"    │               │ → 飞向目标坐标            │
+│ cmd: "land"      │               │ → 降落                   │
+│                  │◄──────────────│                          │
+│                  │  状态反馈JSON  │ {state, pos, health}     │
+└──────────────────┘               └──────────────────────────┘
+```
+
+`state_machine.py` 核心接口：
 
 ```python
-from enum import Enum, auto
-
-class DroneState(Enum):
-    IDLE              = "idle"               # 地面待命
-    PRECHECK          = "precheck"           # 起飞前检查 (VO/battery/GPS)
-    TAKING_OFF        = "taking_off"         # 电机启动 + 爬升
-    HOVERING          = "hovering"           # 悬停等待指令
-    MOVING_TO_TARGET  = "moving_to_target"   # 飞向目标坐标
-    HOLDING_POSITION  = "holding_position"   # 到达目标，悬停保持
-    RETURNING         = "returning"          # 返航
-    LANDING           = "landing"            # 降落中
-    EMERGENCY         = "emergency"          # 紧急悬停
-    DONE              = "done"               # 任务完成
-
-class MissionState(Enum):
-    """车-机联合任务状态"""
-    CAR_SCANNING      = "car_scanning"       # 车辆在扫描目标
-    TARGET_FOUND      = "target_found"       # 车辆发现目标 → 请求起飞
-    DRONE_DISPATCHED  = "drone_dispatched"   # 无人机已起飞，飞向目标
-    DRONE_OVER_TARGET = "drone_over_target"  # 无人机到达目标上空
-    DRONE_RETURNING   = "drone_returning"    # 无人机返航
-    MISSION_COMPLETE  = "mission_complete"   # 任务结束
+sm = DroneStateMachine(flight_ctrl, vo_fusion, position_ctrl)
+# 车辆发来指令
+sm.handle_car_command("takeoff", {"altitude": 0.5})
+sm.handle_car_command("fly_to", {"x": 1.0, "y": 0.5, "z": 0.5})
+sm.handle_car_command("land")
+# 无人机上报状态
+sm.get_status()  # → {drone_state, position, vo_healthy, ...}
 ```
 
-### 5.3 状态转移表
+状态转移：`IDLE → TAKING_OFF → HOVERING → MOVING_TO_TARGET → HOLDING → RETURNING → LANDING → DONE`
+每步有 timeout/重试/异常路径，可随时 `abort()`。待起飞方案修复后联调。
 
-```
-车辆触发                   无人机动作                 状态转移
-─────────────────────────────────────────────────────────────
-车发现目标                → 起飞请求             IDLE → TAKING_OFF
-爬升完成 (h>0.5m)        → 悬停确认             TAKING_OFF → HOVERING
-车提供目标坐标            → 飞向目标             HOVERING → MOVING_TO_TARGET
-到达容差 ±0.15m          → 悬停                  MOVING_TO_TARGET → HOLDING_POSITION
-车确认任务完成            → 返航                  HOLDING_POSITION → RETURNING
-到达 Home 点上空          → 降落                  RETURNING → LANDING
-接地 (h<0.1m)            → 完成                  LANDING → DONE
-
-任意状态 - 低电量 / 通信丢失 / RC 接管 → EMERGENCY
-```
-
-### 5.4 接口设计
-
-```python
-class StateMachineController:
-    """车-机状态机控制器"""
-
-    def __init__(self, flight_ctrl, vo_fusion, position_ctrl):
-        self.drone = DroneState.IDLE
-        self.mission = MissionState.CAR_SCANNING
-        self.ctrl = flight_ctrl
-        self.vo = vo_fusion
-        self.pc = position_ctrl  # PD 位置控制器
-
-    # ─── 车辆侧调用入口 ───
-
-    def car_found_target(self, target_x: float, target_y: float,
-                         target_z: float = 0.5):
-        """车辆发现目标后调用：起飞 → 飞向目标 → 悬停"""
-        pass
-
-    def car_confirm_done(self):
-        """车辆确认任务完成：返航 → 降落"""
-        pass
-
-    def car_emergency(self):
-        """车辆紧急停止无人机"""
-        pass
-
-    # ─── 状态机主循环 ───
-
-    def run(self):
-        """主状态机循环，按当前状态执行动作"""
-        pass
-
-    def _run_precheck(self): ...
-    def _run_taking_off(self): ...
-    def _run_moving_to_target(self): ...
-    def _run_landing(self): ...
-
-    # ─── 回调 ───
-
-    def on_state_change(self, callback): ...
-```
-
-### 5.5 车辆-无人机通信协议
-
-| 方向 | 消息 | 含义 |
-|------|------|------|
-| 车 → 机 | `target_coord {x, y, z}` | 目标在地图系中的坐标 |
-| 车 → 机 | `mission_cmd {takeoff/land/abort}` | 任务控制指令 |
-| 机 → 车 | `drone_state {state, pos, bat}` | 无人机状态反馈 |
-| 机 → 车 | `vo_health_warning` | VO 健康度下降告警 |
-| 机 → 车 | `arrival_confirmed` | 到达目标上空确认 |
-
-### 5.6 开发阶段
+### 5.3 开发阶段
 
 | 阶段 | 内容 | 预估 |
 |------|------|------|
