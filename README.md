@@ -377,79 +377,124 @@ uint8 vo_health          # bit0=xHealth, bit1=yHealth, bit2=zHealth
 
 ## 程序自动飞行
 
-### 原理
-
-上位机通过 WiFi 向机载盒子发布 ROS 消息，盒子内的 fcProxy 转发给 PSDK，PSDK 调用 DJI 飞控 API 控制飞机。全程不需要遥控器干预。
+### 完整指令流程
 
 ```
-上位机 (你的 PC, Windows/Linux)
-  │ Wi-Fi
-  ├─→ /flightByVel  (速度指令, 20Hz)
-  ├─→ /takeoffOrLanding (起降服务)
-  └─← /uavdata (遥测反馈, 10Hz, 含 VO 位置)
-            ↓
-       机载盒子 (RK3588)
-         psdk → dji_sdk_demo_linux_cxx → fcProxy
-            ↓
-       DJI M3E 飞控 → 电机
+STEP 1 ──── 上位机 ──► /takeoffOrLanding(1) ──► fcProxy ──► PSDK ──► Dji_FlightControlMonitoredTakeoff()
+                                                                    │  自动爬升至 ~1.2m
+                                                                    │  joystick 重置为 VELOCITY 模式
+                                                                    │  ← ★ 已修复：MonitoredTakeoff 完成后自动解锁 z 轴
+STEP 2 ──── 上位机 ──► /flightByVel {frame=1, vel_n=-0.3} ──► 向后微移(打破悬停惯性)
+STEP 3 ──── 上位机 ──► /flightByVel {frame=1, vel_d=+0.3} ──► 下降至目标高度
+                                                                    │  Dji_FlightController_ExecuteJoystickAction()
+                                                                    │  vel_d 正值 = Down
+STEP 4 ──── 上位机 ──► /flightByVel {frame=1, vel_d=0} ──► 悬停保持
+STEP 5 ──── 上位机 ──► /takeoffOrLanding(2) ──► 降落
 ```
+
+### `flightByVel` 的 `frame` 字段三种模式
+
+| frame | 模式 | 飞控调用 | vel_n/vel_e 含义 | vel_d 含义 |
+|-------|------|---------|-----------------|------------|
+| 0 | NED 速度 | `Dji_FlightControlVelocityAndYawRateCtrl` | North/East m/s | Down m/s |
+| **1** | **BODY 速度** | `Dji_FlightControlVelocityAndYawRateCtrl` | **Forward/Right m/s** | **Down m/s** |
+| 2 | NED 位置偏移 | `Dji_FlightControlMoveByPositionOffset` | North/East m | Down m |
+
+**室内自动飞行默认使用 frame=1（BODY 速度），不依赖磁罗盘。**
 
 ### 前置条件
 
-1. 飞机开机 + 展开机臂 + Home 点已记录
-2. 遥控器开机 P 档（紧急备用）
-3. 盒子启动三个服务：PSDK → roscore → fcProxy
-4. 上位机设置 `ROS_MASTER_URI=http://<盒子IP>:11311`
+1. 飞机电池装入 → 开机 → **展开机臂** → 窗边等待 GPS 锁定 Home 点（尾灯闪绿）
+2. 保持电池不拔，搬到测试场地
+3. 遥控器开机 P 档（紧急备用，推油门即可接管）
+4. 盒子启动三个服务：
+   ```bash
+   sudo /home/forlinx/psdk/build/bin/dji_sdk_demo_linux_cxx &
+   source /opt/ros/noetic/setup.bash && roscore &
+   source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash && roslaunch tta_m3e_rtsp startup_ctl.launch &
+   ```
+5. 上位机设置 `ROS_MASTER_URI=http://172.20.10.6:11311`
 
 ### 快速起飞测试
 
-在上位机执行（需安装 ROS Noetic + `me3_groundstation`）：
+**在盒子上直接跑**（SSH 进去）：
+
+```bash
+source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash
+python3 ~/test_flight.py
+```
+
+**从上位机发指令**（需安装 ROS Noetic）：
 
 ```python
-import rospy
 from me3_groundstation.flight_control import ME3FlightController
 import time
 
-rospy.init_node("test")
 ctrl = ME3FlightController()
 
-# 起飞 → 上升 20cm → 悬停 2s → 降落
+# 起飞
 ctrl.takeoff()
-time.sleep(3)
+time.sleep(8)  # 等 MonitoredTakeoff 自动完成 + joystick 模式重置
 
-for _ in range(10):
-    ctrl.set_velocity_body(0, 0, -0.3, frame=1)  # BODY, 上升
+# 向后微移（打破悬停惯性，同时验证水平控制）
+for _ in range(5):
+    ctrl.set_velocity_body(-0.3, 0, 0, frame=1)  # BODY, 后退
+    time.sleep(0.1)
+ctrl.hover(1.0)
+
+# 下降至目标高度（vel_d 正值 = Down）
+for _ in range(30):
+    ctrl.set_velocity_body(0, 0, +0.3, frame=1)  # BODY, 下降
     time.sleep(0.1)
 
-for _ in range(20):
-    ctrl.hover(0.1)  # 悬停
-    time.sleep(0.1)
+# 悬停保持
+ctrl.hover(5.0)
 
+# 降落
 ctrl.land()
 ```
 
-也可以在盒子自身上直接跑（SSH 进去）：
+### 实飞验证记录（2026-07-04）
 
-```bash
-source /opt/ros/noetic/setup.bash
-source ~/catkin_ws/devel/setup.bash
-python3 /tmp/test_flight.py
+| 测试 | 起飞 | 高度 | 下降 | 结论 |
+|------|:--:|------|:--:|------|
+| v2~v5 | ✅ | ~110cm | ❌ | MonitoredTakeoff z-lock 导致下降指令被拒 |
+| v6~v9 | ❌ | 0cm | — | 电池低压保护 |
+| v10 | **待测** | — | — | 已修复：MonitoredTakeoff 后自动重置 joystick 为 VELOCITY 模式 |
+
+### 已修复的 PSDK 改动
+
+`flight_logic.c` → `F_AttiCtrlTakeOff()`：
+```c
+// MonitoredTakeoff 完成后，飞控内部锁定在 POSITION 模式
+// 必须手动重置为 VELOCITY 模式，后续速度指令才会生效
+if(Dji_FlightControlMonitoredTakeoff()) {
+    loopInput->flight_flag = 1;
+    T_DjiFlightControllerJoystickMode jm = {
+        DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_HORIZONTAL_GROUND_COORDINATE,
+        DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE,
+    };
+    DjiFlightController_SetJoystickMode(jm);
+}
 ```
 
 ### 关键注意事项
 
-1. **`frame` 字段室内必须设为 `1`**：告诉飞控速度是体坐标系而非 NED。`frame=0` 只在室外 GPS 可用时才安全
-2. **`vel_d` 正值=下降**（NED 坐标系 Down 方向）。上升用负值（如 `vel_d=-0.3`）
-3. **遥控器 P 档必须开着**：PSDK 需要 RC 在 P 模式才能获取摇杆控制权
-4. **遥控器随时可接管**：推动遥控器摇杆，飞控自动交还控制权给 RC，上位机指令被忽略
-5. **起飞后至少等 3 秒**再发速度指令（电机需要加速到起飞转速）
+1. `frame` 室内必须 =1（BODY）。frame=0 依赖罗盘，室内方向有毒
+2. `vel_d` 正值=下降。neg 值=上升（如 `vel_d=-0.3`）
+3. 起飞后至少等 **8 秒**（MonitoredTakeoff 爬升 + joystick 模式重置）
+4. 第一次指令建议**向后微移** 0.3m/s × 0.5s（打破悬停惯性）
+5. 遥控器 P 档随时可接管——推油门立即交还控制权给 RC
 
 ### 安全
 
-- 遥控器推油门 → 立即接管，上位机指令失效
-- PSDK 失去心跳 3s → 飞控自动回到 RC 控制
-- `/uavdata` 不更新 → 上位机安全监控应触发悬停
-- 电池 < 15% → 飞控强制降落（DJI 内置，无法覆盖）
+- **Home 点**：需要 GPS 锁定后才能记录。窗边开机锁点后保持电池不拔即可搬回室内。无 GPS 时也能起飞但无法 RTH
+- 遥控器推油门 → 上位机指令立即失效
+- PSDK 失去心跳 3s → 飞控自动恢复 RC 控制
+- 电池 < 15% → 飞控强制降落（DJI 内置，不可覆盖）
 
 ---
 

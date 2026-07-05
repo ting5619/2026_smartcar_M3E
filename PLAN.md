@@ -1,31 +1,36 @@
 # ME3 无人机上位机运动路径控制 — 实施计划
 
 > 项目代号: ME3-deploy  
-> 目标: 上位机通过 WiFi 控制 DJI Mavic 3E 无人机自动飞行（室内）  
-> 约束: 机载侧仅最小化修改（PSDK 9 文件 ≈ 50 行），上位机自由开发  
-> 日期: 2026-07-04
+> 目标: 上位机通过 WiFi 控制 DJI Mavic 3E 无人机自动飞行（室内），由智能车状态机联动控制  
+> 约束: 机载侧仅最小化修改（PSDK ~10 文件 ≈ 50 行），上位机自由开发  
+> 日期: 2026-07-04 / 更新: 2026-07-05
 
 ---
 
-## 一、已完成 vs 待完成
+## 一、完成度总览
 
 ### ✅ 已完成
 
-| 类别 | 内容 | 状态 |
-|------|------|------|
-| **位置数据源** | PSDK Topic 41 (POSITION_VO) 订阅 → TTALINK → ROS /uavdata | ✅ 已验证 |
-| **数据通路** | 7 文件修改，编译通过，飞行中持续输出 vo_x/y/z/health | ✅ 已验证 |
-| **BODY/NED 切换** | flightByVel 新增 `frame` 字段，PSDK 侧 `F_velCtrlFlight()` 双模式 | ✅ 已实施 |
-| **测试验证** | 室内静止 VO 漂移 <1cm/70s；室外飞行 VO health=3 全程保持 | ✅ 已验证 |
-| **上位机库** | vo_fusion.py, telemetry.py, flight_control.py, path_executor.py 已就绪 | ✅ 已编写 |
-| **测试脚本** | /tmp/test_flight.py (起飞20cm→悬停2s→降落) | ✅ 已部署 |
+| 类别 | 内容 | 验证方式 |
+|------|------|---------|
+| **位置数据源** | PSDK Topic 41 (POSITION_VO) → TTALINK → ROS /uavdata | 室内静止漂移 <1cm/70s，室外飞行 health=3 全程 |
+| **数据通路** | PSDK 6 文件 + ROS 3 文件修改，编译通过 | 飞行中持续输出 vo_x/y/z/health |
+| **BODY/NED 切换** | flightByVel 新增 frame 字段，fcProxy + F_velCtrlFlight 双模式 | 编译通过 |
+| **frame=2 位置偏移** | fcProxy.cpp 支持 frame=2 切换到 ROS_F_GPS_POS_VEL | 编译通过 |
+| **VO 洗毒融合** | vo_fusion.py：四元数旋转 + 陀螺航向积分 + AprilTag 校正 | 理论验证，待实飞 |
+| **上位机库** | telemetry / flight_control / path_executor / safety / utils | 已就绪 |
+| **WiFi 通信** | 172.20.10.6，SSH + ROS 跨机通信 | ✅ 已验证 |
+| **飞行测试** | 17 次起飞测试 | 见 §四 |
 
-### ⏳ 待完成
+### ⏳ 未完成
 
-| 内容 | 说明 |
-|------|------|
-| 实飞测试 | 明天充电完毕执行 test_flight.py |
-| 闭环路径飞行 | 上位机 VO 反馈 + PID 控制 |
+| 内容 | 优先级 | 说明 |
+|------|--------|------|
+| **起飞方案修复** | 🔴 阻塞 | MonitoredTakeoff → TurnOnMotors（见 §五） |
+| **四元数问题调查** | 🟡 中 | 回调输出全 0，计划改用 NED 直通绕过 |
+| **车-机状态机联动** | 🔴 核心 | 车辆检测到目标 → 触发无人机起飞 → 飞行动作 → 降落 → 反馈车辆 |
+| **闭环水平飞行** | 🟡 中 | 等起飞修复后，PID 位置控制 |
+| **AprilTag 精准降落** | 🟢 后 | 已有 tta_apriltag_detect.py，需集成到上位机 |
 
 ---
 
@@ -33,7 +38,7 @@
 
 ### 2.1 由来
 
-M3E 飞控内部已完成 **全向视觉 + 超声波 + IMU + 气压计 + 红外 TOF** 多传感器融合，输出为 PSDK Topic 41 (`DJI_FC_SUBSCRIPTION_TOPIC_POSITION_VO`)。这在 `dji_fc_subscription.h:487` 定义。
+M3E 飞控内部已完成 **全向视觉 + 超声波 + IMU + 气压计 + 红外 TOF** 多传感器融合，输出为 PSDK Topic 41 (`DJI_FC_SUBSCRIPTION_TOPIC_POSITION_VO`)，定义在 `dji_fc_subscription.h:487`。
 
 ### 2.2 结构与性能
 
@@ -81,172 +86,281 @@ VO 的位移增量来源于视觉特征匹配，不依赖罗盘；只有 X-Y 该
 
 ---
 
-## 三、程序自动飞行 — 控制链路
+## 三、飞行测试记录
 
-### 3.1 指令流
+### 3.1 完整测试历史（2026-07-05）
 
-```
-上位机 me3_groundstation
-  │ flight_control.py → set_velocity_body(vx, vy, vz, frame=1)
-  │ path_executor.py  → PID 闭环用 VO 位置反馈
-  ▼ ROS Topic /flightByVel
-fcProxy.cpp → TTALINK 8200 {velN, velE, velD, atti_yaw, param[0]=fly_time, param[1]=frame}
-  ▼ TCP 127.0.0.1:10086
-gcs_receive.cpp → loopInput->frame = param[1]
-  │ SetFlightCtrlSta(ROS_F_GPS_POS_VEL_ALTI_VEL)
-  ▼
-flight_logic.c → F_velCtrlFlight()
-  ├─ frame==0: NED 直通
-  └─ frame!=0: vel_body → vector_XYZ2NED_Quaternion() → Dji_FlightControlVelocityAndYawRateCtrl()
-  ▼
-DJI 飞控 → 电机
-```
+| 测试 | 起飞 | 高度 | 水平 | PSDK 日志 | 根因 |
+|------|:--:|------|:--:|------|------|
+| v2 | ✅ | 109cm | — | 正常 | ref 读在起飞后 |
+| v3~v4 | ✅ | 110cm | ❌ | joystick auth error 0x06 | RC 不在 N 档 |
+| v5 | ✅ | 110cm | ❌ | 同 v3 | frame=2 位置偏移无效果 |
+| v6~v8 | ❌ | 0cm | — | `arrest flying failed` 0x16200301 | 电池低压保护/连续起降禁飞 |
+| v9 | ✅ | 112cm | ❌ | `Obtain joystick failed 0x06` | RC 不在 N 档，代码补丁未生效 |
+| v10 | ✅ | 110cm | ❌ | 四元数全 0：`q[0]:0.000, q[1]:0.000...` | BODY→NED 旋转矩阵为零 |
+| v11 | ✅ | 110cm | ❌ | `Not allowed to obtain joystick in P_MODE` | RC N 档时降下仍被拒 |
+| v12~v13 | ❌ | 0cm | — | 同上 arrest | 飞控 arrested |
+| v14 | ✅ | 106cm | ❌ | `Obtain joystick… failed` | MonitoredTakeoff z-lock |
+| v15 | ✅ | 106cm | ❌ | BODY mode 无效 | 四元数零 → 体坐标系速度被吃掉 |
+| v16 | ✅ | 106cm | ❌ | NED mode 无效 | MonitoredTakeoff 锁所有通道 |
+| v17 | ❌ | 0cm | — | 同上 arrest | 未调用 TurnOnMotors |
 
-### 3.2 BODY/NED 切换开关
+### 3.2 两个已锁定的致命问题
 
-`flightByVel` 消息新增 `uint8 frame` 字段：
+#### 问题 A：MonitoredTakeoff 锁死全部 joystick 通道
 
-| frame 值 | 模式 | 速度含义 | 使用场景 |
-|----------|------|---------|---------|
-| 0 | NED | vel_n=北向, vel_e=东向 | 室外 GPS |
-| 1 (默认) | BODY | vel_n=机头前, vel_e=机身右 | **室内** |
+`Dji_FlightControlMonitoredTakeoff()` 完成后，飞控内部切换到 POSITION 保持模式。**由此产生的 joystick 锁死影响所有轴（x, y, z, yaw），无论后续 SetJoystickMode 和 ObtainJoystickCtrlAuthority 调用多少次都无法解除。** 只有 `srv(2)` landing 能退出。
 
-PSDK `F_velCtrlFlight()` 根据 `frame` 分支：
-- `frame==0`：速度直通 joystick（原有行为，不动）
-- `frame!=0`：体坐标系速度 → quaternion 旋转 → NED 速度 → joystick（新增）
+PSDK 日志证据：MonitoredTakeoff 执行完毕后连续打印 `Obtain joystick authority failed, error code: 0x00000006`，直到 landing 命令发出。
 
-### 3.3 不改的控制链路
+**修复方案**：在 `F_AttiCtrlTakeOff()` 中将 `Dji_FlightControlMonitoredTakeoff()` 替换为 `DjiFlightController_TurnOnMotors()` + 手动设置 VELOCITY joystick 模式 + `ObtainJoystickCtrlAuthority()`。电机的全部速度由 ROS 侧通过 `/flightByVel` 发出。改动量：约 15 行，限于 `flight_logic.c` 一个函数。
 
-- 遥控器 → DJI 飞控（最高优先级）✅
-- `/takeoffOrLanding` 服务 ✅
-- `/gimbalControl` 服务 ✅
-- 飞控自稳、避障、低电量保护 ✅
+#### 问题 B：四元数回调输出全为零
+
+PSDK 日志显示 `Dji_FcSubscriptionReceiveQuaternionCallback` 每次收到的四元数都是 `q = [0.0000, 0.0000, 0.0000, 0.0000]`（PSDK log: `vel flight control --> q[0]:0.0000...`）。四元数全为零时，NED→BODY 旋转矩阵退化为零矩阵，任何体坐标系速度指令在 `vector_XYZ2NED_Quaternion()` 后都变为零向量。
+
+**根因推断**：`QUATERNION` topic 订阅是 5Hz，但 `F_velCtrlFlight()` 中直接从 `g_sensor_data.quaternion` 读取——此时如果 quaternion 回调尚未触发（或 topic 订阅与 g_sensor_data 赋值不在同一线程同步），读到的是初始值全零。
+
+**绕过方案**：使用 `frame=0`（NED 直通模式）发速度指令，完全跳过四元数旋转。此时体坐标系方向无法保证正确，但水平移动指令仍会被执行。等起飞方案修复后可以试验确认方向漂移量级。
 
 ---
 
-## 四、机载侧全部修改清单
+## 四、起飞方案修复（待充电完毕后执行）
 
-### PSDK 侧（6 文件）
+### 4.1 PSDK 侧：flight_logic.c
 
-| 文件 | 行 | 改动 |
-|------|-----|------|
-| `application/sensor.h` | +2 | 加 `T_DjiFcSubscriptionPositionVO positionVO;` 和 `uint8_t frame;` |
-| `application/tta_fc_subscription.c` | +20 | 订阅 topic 41@50Hz + 读取 + 赋值 |
-| `gcs/gcs_transmit.cpp` | +6 | VO 打包到 param[0..3] |
-| `gcs/gcs_receive.cpp` | +1 | param[1] → loopInput->frame |
-| `flight_control/flight_logic.c` | ~30 | F_velCtrlFlight() 双模式重写 |
-| `gcs/gcs_receive.h` | 0 | 无需改动 |
+`F_AttiCtrlTakeOff()` 当前逻辑：
 
-### ROS 侧（3 文件）
+```c
+// 当前（有问题）
+if(loopInput->flight_flag == 0) {
+    if(Dji_FlightControlMonitoredTakeoff()) {
+        loopInput->flight_flag = 1;
+        // 即使在此处设置 VELOCITY 模式也无用——MonitoredTakeoff 已经锁定
+    }
+}
+```
 
-| 文件 | 行 | 改动 |
-|------|-----|------|
-| `msg/uavdata.msg` | +4 | 加 vo_x, vo_y, vo_z, vo_health |
-| `msg/flightByVel.msg` | +1 | 加 uint8 frame |
-| `src/Controller/fcProxy.cpp` | +1 | param[1] = msg->frame |
-| `src/Controller/uavData.h` | +3 | 加 vo 成员 |
-| `src/Controller/uavData.cpp` | +4 | 从 param 提取 VO |
-| `src/Controller/publish.cpp` | +4 | 拷贝到 uavdata |
+目标逻辑：
 
-### 不改的部分
+```c
+// 目标（修复后）
+if(loopInput->flight_flag == 0) {
+    DjiFlightController_TurnOnMotors();
 
-- `fcProxy.cpp` 消息转发核心逻辑
-- `tta_flight_control.c` — 飞控初始化、控制权获取
-- `gcs.cpp` — TTALINK 消息路由
-- TTALINK 协议格式（param[4] 原为预留字段，二进制兼容）
-- `/takeoffOrLanding`、`/gimbalControl`、`rtsp_decode`
+    T_DjiFlightControllerJoystickMode jm = {
+        DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_HORIZONTAL_GROUND_COORDINATE,
+        DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE,
+    };
+    DjiFlightController_SetJoystickMode(jm);
+    DjiFlightController_ObtainJoystickCtrlAuthority();
+
+    loopInput->flight_flag = 1;
+}
+```
+
+### 4.2 ROS 侧：test_flight.py
+
+起飞后的全部运动（爬升、前进、后退、下降）由 `/flightByVel` 的 `frame=0`（NED 直通） 发速度指令完成，绕过四元数。
 
 ---
 
-## 五、上位机模块
+## 五、车-机状态机联动（待开发）
 
-### 已创建
+### 5.1 架构
+
+```
+智能车（上位机）                    机载盒子                    M3E
+┌─────────────────┐   WiFi/ROS    ┌──────────────┐           ┌──────┐
+│ 状态机控制器      │◄════════════►│ fcProxy+PSDK │◄─────────►│ 飞控  │
+│                 │              │              │  USB Bulk │      │
+│ state_machine.py│  /flightByVel│              │           │      │
+│                 │  /uavdata    │              │           │      │
+│                 │  /takeoff... │              │           │      │
+└─────────────────┘              └──────────────┘           └──────┘
+```
+
+### 5.2 状态定义
+
+```python
+from enum import Enum, auto
+
+class DroneState(Enum):
+    IDLE              = "idle"               # 地面待命
+    PRECHECK          = "precheck"           # 起飞前检查 (VO/battery/GPS)
+    TAKING_OFF        = "taking_off"         # 电机启动 + 爬升
+    HOVERING          = "hovering"           # 悬停等待指令
+    MOVING_TO_TARGET  = "moving_to_target"   # 飞向目标坐标
+    HOLDING_POSITION  = "holding_position"   # 到达目标，悬停保持
+    RETURNING         = "returning"          # 返航
+    LANDING           = "landing"            # 降落中
+    EMERGENCY         = "emergency"          # 紧急悬停
+    DONE              = "done"               # 任务完成
+
+class MissionState(Enum):
+    """车-机联合任务状态"""
+    CAR_SCANNING      = "car_scanning"       # 车辆在扫描目标
+    TARGET_FOUND      = "target_found"       # 车辆发现目标 → 请求起飞
+    DRONE_DISPATCHED  = "drone_dispatched"   # 无人机已起飞，飞向目标
+    DRONE_OVER_TARGET = "drone_over_target"  # 无人机到达目标上空
+    DRONE_RETURNING   = "drone_returning"    # 无人机返航
+    MISSION_COMPLETE  = "mission_complete"   # 任务结束
+```
+
+### 5.3 状态转移表
+
+```
+车辆触发                   无人机动作                 状态转移
+─────────────────────────────────────────────────────────────
+车发现目标                → 起飞请求             IDLE → TAKING_OFF
+爬升完成 (h>0.5m)        → 悬停确认             TAKING_OFF → HOVERING
+车提供目标坐标            → 飞向目标             HOVERING → MOVING_TO_TARGET
+到达容差 ±0.15m          → 悬停                  MOVING_TO_TARGET → HOLDING_POSITION
+车确认任务完成            → 返航                  HOLDING_POSITION → RETURNING
+到达 Home 点上空          → 降落                  RETURNING → LANDING
+接地 (h<0.1m)            → 完成                  LANDING → DONE
+
+任意状态 - 低电量 / 通信丢失 / RC 接管 → EMERGENCY
+```
+
+### 5.4 接口设计
+
+```python
+class StateMachineController:
+    """车-机状态机控制器"""
+
+    def __init__(self, flight_ctrl, vo_fusion, position_ctrl):
+        self.drone = DroneState.IDLE
+        self.mission = MissionState.CAR_SCANNING
+        self.ctrl = flight_ctrl
+        self.vo = vo_fusion
+        self.pc = position_ctrl  # PD 位置控制器
+
+    # ─── 车辆侧调用入口 ───
+
+    def car_found_target(self, target_x: float, target_y: float,
+                         target_z: float = 0.5):
+        """车辆发现目标后调用：起飞 → 飞向目标 → 悬停"""
+        pass
+
+    def car_confirm_done(self):
+        """车辆确认任务完成：返航 → 降落"""
+        pass
+
+    def car_emergency(self):
+        """车辆紧急停止无人机"""
+        pass
+
+    # ─── 状态机主循环 ───
+
+    def run(self):
+        """主状态机循环，按当前状态执行动作"""
+        pass
+
+    def _run_precheck(self): ...
+    def _run_taking_off(self): ...
+    def _run_moving_to_target(self): ...
+    def _run_landing(self): ...
+
+    # ─── 回调 ───
+
+    def on_state_change(self, callback): ...
+```
+
+### 5.5 车辆-无人机通信协议
+
+| 方向 | 消息 | 含义 |
+|------|------|------|
+| 车 → 机 | `target_coord {x, y, z}` | 目标在地图系中的坐标 |
+| 车 → 机 | `mission_cmd {takeoff/land/abort}` | 任务控制指令 |
+| 机 → 车 | `drone_state {state, pos, bat}` | 无人机状态反馈 |
+| 机 → 车 | `vo_health_warning` | VO 健康度下降告警 |
+| 机 → 车 | `arrival_confirmed` | 到达目标上空确认 |
+
+### 5.6 开发阶段
+
+| 阶段 | 内容 | 预估 |
+|------|------|------|
+| P1 | 修复起飞（TurnOnMotors + 手动速度控制） | 0.5 天 |
+| P2 | 验证水平移动（NED 直通，frame=0） | 0.5 天 |
+| P3 | 实现状态机控制器 state_machine.py | 1 天 |
+| P4 | 车机联动联调（任务模拟） | 1 天 |
+| P5 | AprilTag 精准降落集成 | 1 天 |
+
+---
+
+## 六、机载侧全部修改清单
+
+### PSDK 侧
+
+| 文件 | 行 | 改动 |
+|------|-----|------|
+| `application/sensor.h` | +2 | 加 positionVO + frame |
+| `application/tta_fc_subscription.c` | +20 | 订阅 topic 41@50Hz |
+| `gcs/gcs_transmit.cpp` | +6 | VO → param[0..3] |
+| `gcs/gcs_receive.cpp` | +1 | param[1] → frame |
+| `flight_control/flight_logic.c` | ~40 | F_velCtrlFlight 双模式 + F_AttiCtrlTakeOff 修复 |
+
+### ROS 侧
+
+| 文件 | 行 | 改动 |
+|------|-----|------|
+| `msg/uavdata.msg` | +4 | vo_x/y/z/health |
+| `msg/flightByVel.msg` | +1 | uint8 frame |
+| `fcProxy.cpp` | +10 | frame→param[1]; frame==2 位置偏移 |
+| `uavData.h/.cpp` | +7 | 提取 VO |
+| `publish.cpp` | +4 | 发布 VO |
+
+### 未改动
+
+- TTALINK 协议格式（param[4] 原本闲置，二进制兼容）
+- `/takeoffOrLanding` / `/gimbalControl` 服务
+- `rtsp_decode` 视频流
+- 飞控自稳、避障、低电量保护
+
+---
+
+## 七、上位机模块
 
 | 文件 | 行数 | 功能 |
 |------|------|------|
-| `me3_groundstation/__init__.py` | 8 | 包入口 |
-| `me3_groundstation/vo_fusion.py` | 370 | VO+陀螺+AprilTag 融合定位引擎 |
-| `me3_groundstation/telemetry.py` | 140 | /uavdata 订阅 + 解析为 TelemetryFrame |
-| `me3_groundstation/utils.py` | 230 | 坐标变换(NED↔ENU↔BODY)、GPS计算、滤波器 |
-| `me3_groundstation/flight_control.py` | 130 | 封装 /flightByVel + /takeoffOrLanding + /gimbalControl，自动判断 frame=1(BODY) vs frame=0(NED) |
-| `me3_groundstation/live_position.py` | 80 | 实时位置查看器 |
-| `me3_groundstation/path_executor.py` | 170 | PID 闭环路径执行器，VO 位置反馈驱动体坐标系速度 |
-| `examples/takeoff_hover_land.py` | 60 | 起飞→悬停→降落测试脚本 |
-
-### 接口速查
-
-```python
-from me3_groundstation.flight_control import ME3FlightController
-from me3_groundstation.vo_fusion import VOFusion
-from me3_groundstation.path_executor import PathExecutor
-
-# 飞行控制
-ctrl = ME3FlightController()
-ctrl.takeoff()                           # 起飞
-ctrl.land()                              # 降落
-ctrl.set_velocity_body(1.0, 0, 0, frame=1)  # 体坐标 前进1m/s
-ctrl.hover(2.0)                          # 悬停2秒
-
-# VO 定位（不依赖罗盘）
-vo = VOFusion()
-vo.start()
-vo.feed_vo(vx, vy, vz, health, t)        # 喂 VO 数据
-vo.feed_quaternion(q0,q1,q2,q3,t)        # 喂姿态
-vo.feed_gyro(gx, gy, gz, t)              # 喂陀螺
-vo.correct_by_apriltag(tag_x, tag_y)     # 视觉校正
-x, y, z = vo.get_position()              # 获取位置
-
-# 闭环路径执行
-executor = PathExecutor(ctrl, vo)
-executor.takeoff_and_hover(0.2, 2.0)     # 起飞20cm悬停2s
-executor.move_relative_body(1.0, 0)      # 前进1m（闭环）
-executor.land()                           # 降落
-```
+| `vo_fusion.py` | 370 | VO+陀螺+AprilTag 融合定位引擎，全 PD 保护 |
+| `telemetry.py` | 140 | /uavdata 订阅 + TelemetryFrame 解析 |
+| `utils.py` | 230 | 坐标变换、GPS 计算、滤波器 |
+| `flight_control.py` | 138 | /flightByVel(takeoff/land/gimbal，frame=0/1/2) |
+| `path_executor.py` | 260 | PD 位置控制器：fly_to(), fly_path(), takeoff(), land() |
+| `safety.py` | 140 | 起飞前检查、飞行中监控、hearthbeat/VO/高度 |
+| `live_position.py` | 80 | 实时 VO 位置查看器 |
+| `examples/takeoff_hover_land.py` | 60 | 起飞测试 |
 
 ---
 
-## 六、测试结果
-
-### VO 室内验证（2026-07-04）
-
-| 测试 | 结果 |
-|------|------|
-| 静止 70s 漂移 | 0.1cm (net) |
-| 静止噪声 | x: 0.8cm σ, y: 0.9cm σ |
-| 搬运 75cm 检测 | VO x 跟踪到 -0.75m，清晰可辨 |
-| VO health 全程 | 100% (3 = xH✅ yH✅ zH❌) |
-| 初始化时间 | ~3s（30 frames） |
-
-### VO 室外飞行验证（2026-07-04）
-
-| 测试 | 结果 |
-|------|------|
-| 飞行时长 | 约 14 分钟 |
-| VO health | 100% (全程 =3) |
-| 低空降落后 VO 稳定性 | 波动 < 2cm |
-| 兼容性 | 遥控飞行期间 VO 数据正常推送，不影响飞行 |
-
----
-
-## 七、风险与已知限制
+## 八、风险与已知限制
 
 | 风险 | 缓解 |
 |------|------|
-| VO 纹理不足 → xHealth/yHealth=0 | 降低高度、增加地面纹理标记、降级为纯惯性+AprilTag |
-| 陀螺偏航漂移 (~1°/min) | AprilTag 定时校正航向 |
-| 室内罗盘不准 → NED 不可用 | **默认 BODY 坐标系**，不依赖罗盘 |
-| WiFi 延迟导致位姿与指令不同步 | 时间戳对齐，VO 外推 |
-| 遥控器优先级 > PSDK | 监听到 RC 接管立即停止发指令 |
-| 当前 /flightByVel 的 frame 字段只对 vel 控制有效 | 起降不受影响；如需 NED 定点飞行需额外开发 |
+| MonitoredTakeoff joystick lock | → TurnOnMotors + 手动速度控制 |
+| 四元数回调全零 | → NED 直通 (frame=0) 绕过 BODY 转换 |
+| 飞控 arrested 状态 (HMS 0x16200301) | 拔电池 10 秒重置 |
+| RC 不在 N 档 → joystick auth 失败 | 起飞前检查 RC 档位 |
+| 遥控器摇杆偏移 → RC 自动接管 | 遥控器放桌面勿碰 |
+| VO 室内纹理不足 → xHealth/yHealth=0 | 降低高度、增加地面标记 |
+| 陀螺偏航漂移 | AprilTag 定时校正 |
+| WiFi 高延迟/丢包 | 长命令走 nohup+日志文件 |
 
 ---
 
-## 八、参考
+## 九、参考
 
 - [ME3 项目文档分析](../ME3/ME3项目文档分析.md)
 - [机载盒子修改记录](../ME3-deploy/onboard_box/MODIFICATIONS.md)
+- [使用手册 README.md](./README.md)
 - PSDK `dji_fc_subscription.h` — POSITION_VO (topic 41, line 487)
-- PSDK `dji_flight_controller.h` — 坐标系枚举 (line 215-218)
-- `tta_odom.cpp` — 原始开发者 odom 测试
-- 机载盒子 `tta_fc_subscription.c` — 订阅清单
-- 机载盒子 `flight_logic.c` — F_velCtrlFlight() 双模式实现
+- PSDK `dji_flight_controller.h` — 坐标系枚举 / 控制 API
+- PSDK `flight_logic.c` — F_velCtrlFlight() / F_AttiCtrlTakeOff()
+- 机载盒子 `tta_fc_subscription.c` — 当前 topic 订阅清单
+- 机载盒子 `gcs_transmit.cpp` — TTALINK feedback 打包
+- `tta_odom.cpp` — 原始开发者 odom 测试（作者注明"积分误差太大"）
